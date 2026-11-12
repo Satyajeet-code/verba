@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Verba</string>
+    <string name="widget_title">Notes</string>
+    <string name="widget_no_notes">No notes</string>
+    <string name="widget_empty">Pencil to write · mic to record</string>
+    <string name="widget_new_text">New text note</string>
+    <string name="widget_new_voice">New voice note</string>
+    <string name="widget_delete">Move to Recently Deleted</string>
+    <string name="widget_description">Recent notes on glass. Add text or voice notes, delete, resize.</string>
+    <string name="quick_note">Quick note</string>
+    <string name="quick_voice">Voice note</string>
+</resources>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and lower: back up the notes database only (models are re-downloadable, recordings can be large). -->
+<full-backup-content>
+    <include domain="file" path="notes.db" />
+    <include domain="file" path="notes.db-wal" />
+</full-backup-content>
