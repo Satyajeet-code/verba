@@ -1,0 +1,169 @@
+name: Speech models
+
+# Converts the Hinglish speech models (fine-tunes of Qwen3-ASR 0.6B published
+# on Hugging Face) into the on-device format the Verba app uses, tests each
+# one against the stock Qwen3-ASR on the clips in tools/testclips.zip, and
+# publishes it on this repository's Releases page under the "models" tag.
+# The app downloads them from there (Settings > Speech models).
+#
+# Each model is converted only once (about 30 minutes). Later runs see it is
+# already published and finish in a few seconds.
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Convert again even if already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # needed to publish the models as a Release
+
+concurrency:
+  group: speech-models
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make sure the "models" release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view models >/dev/null 2>&1; then
+            gh release create models --prerelease --title "Speech models for Verba" \
+              --notes "Speech-to-text models that the Verba app downloads (Settings > Speech models). This is not an app build: the APK is in the build-N releases."
+          fi
+
+  convert:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: verba-hinglish-srota-0.6b-int8
+            hf: moorlee/qwen3-asr-0.6b-hinglish
+          - name: verba-hinglish-srota-conv-0.6b-int8
+            hf: moorlee/qwen3-asr-0.6b-hinglish-hiacc-v1
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NAME: ${{ matrix.name }}
+      HF_MODEL: ${{ matrix.hf }}
+      BASE: sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25
+    steps:
+      - name: Check whether it is already published
+        id: check
+        run: |
+          if [ "${{ inputs.rebuild }}" != "true" ] && \
+             gh release view models --json assets --jq '.assets[].name' | grep -qx "$NAME.json"; then
+            echo "$NAME is already published. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get the files from this repository
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/checkout@v7
+
+      - name: Find the test clips and scripts
+        id: tools
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          script=$(find . -maxdepth 4 -path ./.git -prune -o -name compare_models.py -type f -print | head -n 1)
+          if [ -z "$script" ]; then
+            echo "::notice::The tools folder is not in the repository yet; the models will be converted after it is uploaded."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "TOOLS=$(realpath "$(dirname "$script")")" >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Set up Python 3.13
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install the converter
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers==4.57.6 huggingface_hub==0.36.2 safetensors==0.8.0 tokenizers==0.22.2 \
+            onnx==1.23.2 onnxruntime==1.22.0 onnxscript==0.7.2 numpy==2.5.4 \
+            sherpa-onnx==2.0.1 soundfile==0.14.0
+          git clone -q https://github.com/Wasser1462/Qwen3-ASR-onnx converter
+          git -C converter checkout -q 0829a577ee741e408e65763dfe01ff4fe75408e9
+
+      - name: Download ${{ matrix.hf }} from Hugging Face
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          python - <<'EOF'
+          import os
+          from huggingface_hub import snapshot_download
+          snapshot_download(os.environ["HF_MODEL"], local_dir="checkpoint",
+                            allow_patterns=["*.json", "*.safetensors", "merges.txt", "vocab.json", "*.jinja"])
+          EOF
+          ls -la checkpoint
+          python "$TOOLS/check_checkpoint.py" checkpoint converter
+
+      - name: Convert to ONNX (int8)
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          cd converter
+          python export_qwen3_asr_onnx.py --model ../checkpoint --outdir ../onnx \
+            --device cpu --max-total-len 512 --verify
+          ls -la ../onnx
+
+      - name: Package
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          mkdir -p "$NAME/tokenizer"
+          cp onnx/conv_frontend.onnx onnx/encoder.int8.onnx onnx/decoder.int8.onnx "$NAME/"
+          cp checkpoint/vocab.json checkpoint/merges.txt checkpoint/tokenizer_config.json "$NAME/tokenizer/"
+          rm -rf onnx checkpoint
+          tar -czf "$NAME.tar.gz" "$NAME"
+          ls -la "$NAME" "$NAME.tar.gz"
+
+      - name: Test against the stock Qwen3-ASR
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          curl -sSL --retry 3 -o base.tar.bz2 \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/$BASE.tar.bz2"
+          tar -xjf base.tar.bz2 --wildcards "$BASE/*.onnx" "$BASE/tokenizer/*"
+          rm base.tar.bz2
+          unzip -q -o "$TOOLS/testclips.zip" -d testclips
+          python "$TOOLS/compare_models.py" "$NAME" "$BASE" testclips
+
+      - name: Publish on the Releases page
+        if: steps.check.outputs.skip != 'true' && steps.tools.outputs.skip != 'true'
+        run: |
+          python - <<'EOF'
+          import hashlib, json, os
+          name = os.environ["NAME"]
+          f = name + ".tar.gz"
+          h = hashlib.sha256()
+          with open(f, "rb") as fh:
+              for block in iter(lambda: fh.read(1 << 20), b""):
+                  h.update(block)
+          info = {"file": f, "size": os.path.getsize(f), "sha256": h.hexdigest(), "root": name,
+                  "source": "https://huggingface.co/" + os.environ["HF_MODEL"]}
+          json.dump(info, open(name + ".json", "w"), indent=1)
+          print(info)
+          EOF
+          # the archive first, then the small manifest that tells the app it is ready
+          gh release upload models "$NAME.tar.gz" --clobber
+          gh release upload models "$NAME.json" --clobber
